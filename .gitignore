@@ -1,0 +1,6 @@
+# Misc
+.env
+.env.*
+
+# JS/TS
+node_modules
