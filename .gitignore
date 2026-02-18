@@ -4,3 +4,6 @@
 
 # JS/TS
 node_modules
+
+.idea
+.vscode
