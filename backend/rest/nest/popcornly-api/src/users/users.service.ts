@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { DbService } from '../db/db.service';
 import { usersTable } from '../db/schema';
-import { eq } from 'drizzle-orm';
+import { eq, or } from 'drizzle-orm';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 
@@ -40,6 +40,26 @@ export class UsersService {
     return users[0];
   }
 
+  private async findUserByEmail(email: string): Promise<User> {
+    const users = await this.db.drizzle
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.email, email))
+      .limit(1);
+    if (!users[0]) throw new NotFoundException('User not found');
+    return users[0];
+  }
+
+  private async findUserByEmailOrUsername(login: string): Promise<User> {
+    const users = await this.db.drizzle
+      .select()
+      .from(usersTable)
+      .where(or(eq(usersTable.email, login), eq(usersTable.username, login)))
+      .limit(1);
+    if (!users[0]) throw new NotFoundException('User not found');
+    return users[0];
+  }
+
   // Public
 
   async findAll(): Promise<SafeUser[]> {
@@ -52,13 +72,29 @@ export class UsersService {
     return this.stripPassword(user);
   }
 
+  async findByEmail(email: string): Promise<SafeUser> {
+    const user = await this.findUserByEmail(email);
+    return this.stripPassword(user);
+  }
+
+  /** @internal Only use in AuthService for password comparison */
+  async findForAuth(login: string): Promise<User> {
+    return this.findUserByEmailOrUsername(login);
+  }
+
   async create(dto: CreateUserDto): Promise<SafeUser> {
     const existing = await this.db.drizzle
       .select()
       .from(usersTable)
-      .where(eq(usersTable.email, dto.email))
+      .where(
+        or(
+          eq(usersTable.email, dto.email),
+          eq(usersTable.username, dto.username),
+        ),
+      )
       .limit(1);
-    if (existing[0]) throw new ConflictException('Email already in use');
+    if (existing[0])
+      throw new ConflictException('Email or username already in use');
 
     const password = await this.hashPassword(dto.password);
     const created = await this.db.drizzle
