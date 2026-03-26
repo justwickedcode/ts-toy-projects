@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 const DEFAULTS = {
-    outputPath: "./videos",
+    outputPath: "./recordings",
     timeLimitSeconds: 180,
     quality: "low" as RecordingQuality,
     pollIntervalMs: 200,
