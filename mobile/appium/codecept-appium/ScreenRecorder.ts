@@ -11,7 +11,7 @@ const DEFAULTS = {
     pollIntervalMs: 200,
     fileReadyTimeoutMs: 15_000,
     keepAliveTapIntervalMs: 1_000,
-    minValidFileSizeBytes: 200_000,
+    minValidFileSizeBytes: 500_000,
 } as const;
 
 const QUALITY_BITRATE: Record<RecordingQuality, number> = {
@@ -62,13 +62,13 @@ export class AdbError extends Error {
 type RecorderState =
     | { status: "idle" }
     | {
-    status: "recording";
-    process: ChildProcess;
-    devicePid: number;
-    localPath: string;
-    devicePath: string;
-    keepAliveInterval: ReturnType<typeof setInterval>;
-};
+          status: "recording";
+          process: ChildProcess;
+          devicePid: number;
+          localPath: string;
+          devicePath: string;
+          keepAliveInterval: ReturnType<typeof setInterval>;
+      };
 
 // ─── AdbClient ───────────────────────────────────────────────────────────────
 
@@ -328,8 +328,7 @@ export class ScreenRecorder {
         if (fileSize < DEFAULTS.minValidFileSizeBytes) {
             fs.unlinkSync(localPath);
             throw new RecordingError(
-                `Recording is too small to be valid (${(fileSize / 1_000).toFixed(1)} KB) — deleted. \n
-                (On Android 16, screen recording a "static one frame screen" via adb will produce a one frame mp4 file, which is not playable.)`
+                `Recording is too small to be valid (${(fileSize / 1_000).toFixed(1)} KB) — deleted.`
             );
         }
 

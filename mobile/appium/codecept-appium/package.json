@@ -1,0 +1,19 @@
+{
+  "name": "codecept-appium-recorder",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "codeceptjs run --steps",
+    "test:report": "codeceptjs run --steps && allure generate allure-results --clean -o allure-report && allure open allure-report"
+  },
+  "dependencies": {
+    "codeceptjs": "^3.6.4",
+    "webdriverio": "^8.29.1",
+    "@wdio/appium-service": "^8.29.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "allure-codeceptjs": "^3.0.0",
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.2"
+  }
+}
