@@ -26,27 +26,22 @@ export interface RecordingOptions {
     timeLimitSeconds?: number;
 }
 
-/**
- * Plug in your own logger if you don't want console output.
- * Every method is optional — missing ones are silently skipped.
- */
 export interface Logger {
     info?: (msg: string) => void;
     warn?: (msg: string) => void;
     error?: (msg: string) => void;
 }
 
-// These are the only states the recorder can be in.
 type RecorderState =
     | { status: "idle" }
     | {
     status: "recording";
     process: ChildProcess;
+    devicePid: number;
     localPath: string;
     devicePath: string;
 };
 
-// Errors
 export class RecordingError extends Error {
     constructor(message: string) {
         super(message);
@@ -61,16 +56,26 @@ export class AdbError extends Error {
     }
 }
 
-/**
- * Thin wrapper around the `adb` binary.
- *
- * Extracted so (a) the recorder doesn't have raw spawn calls everywhere,
- * and (b) you could swap in a mock for tests.
- */
 class AdbClient {
-    constructor(private serial: string | null) {}
+    private serial: string;
 
-    /** Run a synchronous adb command. Throws AdbError on non-zero exit. */
+    constructor(serial: string | null) {
+        if (serial) {
+            this.serial = serial;
+        } else {
+            // `adb devices` output looks like:
+            //   List of devices attached
+            //   emulator-5554   device
+            //   R38M123ABC      device
+            // We grab the first serial from the second line onward.
+            const result = spawnSync("adb", ["devices"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+            const lines = result.stdout.trim().split("\n").slice(1);
+            const first = lines.find((l) => l.includes("\tdevice"));
+            if (!first) throw new AdbError("No connected adb devices found", result.stderr);
+            this.serial = first.split("\t")[0].trim();
+        }
+    }
+
     exec(args: string[]): string {
         const serialArgs = this.serial ? ["-s", this.serial] : [];
         const result = spawnSync("adb", [...serialArgs, ...args], {
@@ -85,16 +90,49 @@ class AdbClient {
         return result.stdout;
     }
 
-    /** Spawn a long-running adb command (like screenrecord). */
-    spawn(args: string[]): ChildProcess {
+    /**
+     * Spawns screenrecord in the background on-device and captures its PID.
+     *
+     * We run the whole thing as a single shell command:
+     *   screenrecord [args] <path> & echo $!
+     *
+     * The `&` backgrounds screenrecord so the shell immediately prints $!
+     * (the PID of the last backgrounded job) to stdout, which we can read.
+     *
+     * stdio is set to "pipe" here (not "inherit") so we can read that PID.
+     */
+    spawnAndCapturePid(recordArgs: string[], devicePath: string): { process: ChildProcess; pidPromise: Promise<number> } {
         const serialArgs = this.serial ? ["-s", this.serial] : [];
-        return spawn("adb", [...serialArgs, ...args], { stdio: "inherit" });
+        const shellCmd = `screenrecord ${recordArgs.join(" ")} ${devicePath} & echo $!`;
+
+        const proc = spawn("adb", [...serialArgs, "shell", shellCmd], {
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        const pidPromise = new Promise<number>((resolve, reject) => {
+            let stdout = "";
+
+            proc.stdout!.on("data", (chunk: Buffer) => {
+                stdout += chunk.toString();
+                const pid = parseInt(stdout.trim(), 10);
+                if (!isNaN(pid) && pid > 0) resolve(pid);
+            });
+
+            proc.once("error", reject);
+
+            // Fallback: if process exits before we got a PID, reject
+            proc.once("close", () => {
+                const pid = parseInt(stdout.trim(), 10);
+                if (isNaN(pid) || pid <= 0) {
+                    reject(new RecordingError("Failed to capture device PID from screenrecord"));
+                }
+            });
+        });
+
+        return { process: proc, pidPromise };
     }
 
-    /** Get file size on device. Returns -1 if the file doesn't exist yet. */
     getDeviceFileSize(devicePath: string): number {
-        // We don't use exec() here because a missing file isn't an "error" —
-        // the stat command is designed to return -1 via the `|| echo -1` fallback.
         const serialArgs = this.serial ? ["-s", this.serial] : [];
         const result = spawnSync(
             "adb",
@@ -105,7 +143,6 @@ class AdbClient {
     }
 }
 
-// Helpers
 function generateFilename(): string {
     return (
         "recording_" +
@@ -118,11 +155,6 @@ function generateFilename(): string {
     );
 }
 
-/**
- * Resolves when the child process exits.
- * We need this because screenrecord only finishes writing
- * the mp4 container AFTER the adb process fully exits.
- */
 function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
         if (proc.exitCode !== null) return resolve();
@@ -139,11 +171,6 @@ function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<void> {
     });
 }
 
-/**
- * Polls device file size until two consecutive reads return the same value.
- * Only meaningful AFTER the adb process exits — before that, the file
- * can appear "stable" at a tiny size while screenrecord is still buffering.
- */
 async function waitForFileStable(
     adb: AdbClient,
     devicePath: string,
@@ -162,8 +189,6 @@ async function waitForFileStable(
     return false;
 }
 
-// ─── Main Class ──────────────────────────────
-
 export class ScreenRecorder {
     private state: RecorderState = { status: "idle" };
     private adb: AdbClient;
@@ -171,10 +196,6 @@ export class ScreenRecorder {
 
     constructor(deviceSerial?: string, logger?: Logger) {
         this.adb = new AdbClient(deviceSerial ?? null);
-
-        // Build a "safe" logger: if the caller didn't provide a method, use a no-op.
-        // This avoids `if (this.log.info)` checks everywhere.
-        const noop = () => {};
         this.log = {
             info: logger?.info ?? console.log,
             warn: logger?.warn ?? console.warn,
@@ -190,11 +211,7 @@ export class ScreenRecorder {
         return this.state.status === "recording" ? this.state.localPath : null;
     }
 
-    /**
-     * Kick off a screen recording on the connected device.
-     * Throws if already recording — call stopRecording() first.
-     */
-    startRecording(options: RecordingOptions = {}): void {
+    async startRecording(options: RecordingOptions = {}): Promise<void> {
         if (this.state.status === "recording") {
             throw new RecordingError("Already recording. Call stopRecording() first.");
         }
@@ -212,52 +229,48 @@ export class ScreenRecorder {
 
         this.log.info(`[ScreenRecorder] Starting (${quality} / ${bitrate} Mbps)`);
 
-        const proc = this.adb.spawn([
-            "shell",
-            "screenrecord",
+        const recordArgs = [
             "--bit-rate", `${bitrate * 1_000_000}`,
             "--time-limit", `${timeLimit}`,
-            devicePath,
-        ]);
+        ];
+
+        const { process: proc, pidPromise } = this.adb.spawnAndCapturePid(recordArgs, devicePath);
 
         proc.on("error", (err) => {
             this.log.error(`[ScreenRecorder] Process error: ${err.message}`);
             this.state = { status: "idle" };
         });
 
-        // Transition to "recording" — all the data we need for stopRecording
-        // is captured right here in the state object.
-        this.state = { status: "recording", process: proc, localPath, devicePath };
+        // Wait for the PID before marking state as recording —
+        // stopRecording() needs it, so we can't proceed without it.
+        const devicePid = await pidPromise;
+        this.log.info(`[ScreenRecorder] Device PID: ${devicePid}`);
+
+        this.state = { status: "recording", process: proc, devicePid, localPath, devicePath };
     }
 
-    /**
-     * Stop recording, pull the file to your machine, clean up the device.
-     *
-     * Returns the local file path on success.
-     *
-     * Order of operations matters here:
-     *   1. SIGINT  →  tells screenrecord to finalize the mp4 container
-     *   2. Wait for process exit  →  file is only complete after this
-     *   3. Poll file size  →  filesystem flush guard
-     *   4. adb pull  →  copy to local machine
-     *   5. Delete from device
-     */
     async stopRecording(): Promise<string> {
         if (this.state.status !== "recording") {
             throw new RecordingError("No active recording to stop.");
         }
 
-        // Destructure everything we need, then immediately mark as idle.
-        // This prevents double-stop calls from racing.
-        const { process: proc, localPath, devicePath } = this.state;
+        const { process: proc, devicePid, localPath, devicePath } = this.state;
         this.state = { status: "idle" };
 
         const t0 = Date.now();
 
-        // 1. Signal stop
-        proc.kill("SIGINT");
+        // 1. Send SIGINT to screenrecord ON the device.
+        //    This is the key fix: we're not calling proc.kill() (which is broken
+        //    on Windows), we're sending kill -2 through adb shell instead.
+        //    kill -2 = SIGINT, which tells screenrecord to finalize the mp4 container.
+        this.log.info(`[ScreenRecorder] Sending SIGINT to device PID ${devicePid}`);
+        try {
+            this.adb.exec(["shell", "kill", "-2", String(devicePid)]);
+        } catch (e) {
+            this.log.warn("[ScreenRecorder] kill -2 failed — process may have already exited");
+        }
 
-        // 2. Wait for full exit
+        // 2. Wait for the adb tunnel process to exit naturally
         this.log.info("[ScreenRecorder] Waiting for finalization...");
         try {
             await waitForExit(proc, DEFAULTS.fileReadyTimeoutMs);
@@ -282,7 +295,7 @@ export class ScreenRecorder {
             throw e;
         }
 
-        // 5. Clean up device (best-effort — we don't throw if this fails)
+        // 5. Clean up device
         try {
             this.adb.exec(["shell", "rm", devicePath]);
         } catch {
@@ -295,7 +308,6 @@ export class ScreenRecorder {
         return localPath;
     }
 
-    /** Delete the most recently pulled recording from your local disk. */
     deleteRecording(filePath: string): void {
         if (!fs.existsSync(filePath)) {
             throw new RecordingError(`File not found: ${filePath}`);
