@@ -1,0 +1,12 @@
+import { pgTable, serial, text, timestamp, integer } from 'drizzle-orm/pg-core';
+import { usersTable } from './users.schema';
+
+export const mfaBackupCodesTable = pgTable('mfa_backup_codes', {
+  id: serial().primaryKey(),
+  user_id: integer()
+    .notNull()
+    .references(() => usersTable.id, { onDelete: 'cascade' }),
+  used_at: timestamp({ withTimezone: true }),
+  code: text().notNull(),
+  created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
+});

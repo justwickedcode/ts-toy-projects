@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1772827816442,
+      "tag": "0000_conscious_green_goblin",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1773264478482,
+      "tag": "0001_round_lady_deathstrike",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1774727970335,
+      "tag": "0002_overconfident_frog_thor",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1774742185137,
+      "tag": "0003_faulty_war_machine",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1775159885696,
+      "tag": "0004_special_the_spike",
+      "breakpoints": true
+    }
+  ]
+}
