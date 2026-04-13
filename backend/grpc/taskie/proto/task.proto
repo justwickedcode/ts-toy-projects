@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package task;
+
+message SubmitTaskRequest {
+  string name = 1;
+  int32 duration_seconds = 2;
+}
+
+message SubmitTaskResponse {
+  string task_id = 1;
+}
+
+message WatchTaskRequest {
+  string task_id = 1;
+}
+
+message TaskUpdate {
+  string task_id = 1;
+  int32 progress = 2;
+  string status = 3;
+}
+
+service TaskService {
+  rpc SubmitTask (SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc WatchTask (WatchTaskRequest) returns (stream TaskUpdate);
+}
