@@ -1,0 +1,12 @@
+services:
+  appium:
+    image: appium/appium:latest
+    container_name: appium
+    ports:
+      - "4723:4723"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - ANDROID_ADB_SERVER_ADDRESS=host.docker.internal
+      - ANDROID_ADB_SERVER_PORT=5037
+    entrypoint: ["appium", "--allow-insecure=*:adb_shell", "--allow-cors"]
