@@ -1,6 +1,7 @@
 import { spawn, ChildProcess, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import ffmpegPath from "ffmpeg-static";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -12,6 +13,7 @@ const DEFAULTS = {
     fileReadyTimeoutMs: 15_000,
     keepAliveTapIntervalMs: 1_000,
     minValidFileSizeBytes: 200_000,
+    ffmpegCrf: 23,
 } as const;
 
 const QUALITY_BITRATE: Record<RecordingQuality, number> = {
@@ -33,6 +35,11 @@ export interface RecordingOptions {
     filename?: string;
     /** Hard cap on recording length in seconds. Defaults to 180. */
     timeLimitSeconds?: number;
+    /**
+     * CRF value passed to ffmpeg libx264 (0–51). Lower = larger/better quality.
+     * Defaults to 23. Set to null to skip re-encoding entirely.
+     */
+    ffmpegCrf?: number | null;
 }
 
 export interface Logger {
@@ -100,7 +107,7 @@ class AdbClient {
             throw new AdbError("No connected adb devices found", result.stderr);
         }
 
-        this.serial = first.split("\t")[0].trim();
+        this.serial = first.split("\t")[0]!.trim();
     }
 
     /** Run a synchronous adb command. Throws AdbError on non-zero exit. */
@@ -191,6 +198,78 @@ function generateFilename(): string {
     );
 }
 
+/**
+ * Resolves the ffmpeg binary path from ffmpeg-static.
+ * Throws RecordingError if the package didn't bundle a binary for this platform.
+ */
+function resolveFfmpeg(): string {
+    if (!ffmpegPath) {
+        throw new RecordingError(
+            "ffmpeg-static did not resolve a binary for this platform. " +
+            "Try reinstalling: bun add ffmpeg-static"
+        );
+    }
+    return ffmpegPath;
+}
+
+/**
+ * Re-encodes inputPath in-place using libx264 + the given CRF value.
+ *
+ * Strategy:
+ *   1. Encode to a sibling .tmp.mp4 file.
+ *   2. On success, delete the original and rename the temp file over it.
+ *   3. On failure, delete the temp file and rethrow.
+ *
+ * `-an`               — drop audio track (screenrecords have none; keeps file smaller)
+ * `-crf`              — quality/size tradeoff (0–51, lower = better; 23 is a sane default)
+ * `-preset fast`      — encoding speed vs compression (good balance for CI use)
+ * `-movflags +faststart` — move the moov atom to the front for streaming/playback compat
+ * `-y`                — overwrite temp file without prompting
+ */
+function reencodeVideo(inputPath: string, crf: number, log: Required<Logger>): void {
+    const bin = resolveFfmpeg();
+
+    const dir = path.dirname(inputPath);
+    const base = path.basename(inputPath, ".mp4");
+    const tmpPath = path.join(dir, `${base}.tmp.mp4`);
+
+    const t0 = Date.now();
+    log.info(`[ScreenRecorder] Re-encoding with ffmpeg (CRF ${crf})…`);
+
+    const result = spawnSync(
+        bin,
+        [
+            "-i", inputPath,
+            "-c:v", "libx264",
+            "-crf", String(crf),
+            "-preset", "fast",
+            "-an",
+            "-movflags", "+faststart",
+            "-y",
+            tmpPath,
+        ],
+        {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+        }
+    );
+
+    if (result.status !== 0) {
+        // Clean up the partial temp file if ffmpeg bailed out mid-encode.
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+        throw new RecordingError(
+            `ffmpeg re-encode failed (exit ${result.status}):\n${result.stderr}`
+        );
+    }
+
+    // Swap temp → final in two atomic-ish steps.
+    fs.unlinkSync(inputPath);
+    fs.renameSync(tmpPath, inputPath);
+
+    const sizeMb = (fs.statSync(inputPath).size / 1_000_000).toFixed(2);
+    log.info(`[ScreenRecorder] Re-encode done — ${sizeMb} MB in ${Date.now() - t0}ms`);
+}
+
 // ─── ScreenRecorder ──────────────────────────────────────────────────────────
 
 export class ScreenRecorder {
@@ -261,20 +340,28 @@ export class ScreenRecorder {
     }
 
     /**
-     * Stops the current recording, pulls the file to disk, and returns its local path.
+     * Stops the current recording, pulls the file to disk, re-encodes it with
+     * ffmpeg for compatibility and compression, and returns the local path.
      *
      * Throws RecordingError if:
      * - No recording is active
      * - The adb pull fails
      * - The pulled file is below the minimum valid size (likely corrupt)
+     * - ffmpeg-static didn't resolve a binary for this platform
+     * - ffmpeg exits with a non-zero status
      */
-    async stopRecording(): Promise<string> {
+    async stopRecording(options: RecordingOptions = {}): Promise<string> {
         if (this.state.status !== "recording") {
             throw new RecordingError("No active recording to stop.");
         }
 
         const { process: proc, devicePid, localPath, devicePath, keepAliveInterval } = this.state;
         this.state = { status: "idle" };
+
+        // Resolve the CRF. Passing null opts out of re-encoding entirely.
+        const ffmpegCrf = options.ffmpegCrf !== undefined
+            ? options.ffmpegCrf
+            : DEFAULTS.ffmpegCrf;
 
         clearInterval(keepAliveInterval);
 
@@ -328,12 +415,21 @@ export class ScreenRecorder {
         if (fileSize < DEFAULTS.minValidFileSizeBytes) {
             fs.unlinkSync(localPath);
             throw new RecordingError(
-                `Recording is too small to be valid (${(fileSize / 1_000).toFixed(1)} KB) — deleted. \n
-                (On Android 16, screen recording a "static one frame screen" via adb will produce a one frame mp4 file, which is not playable.)`
+                `Recording is too small to be valid (${(fileSize / 1_000).toFixed(1)} KB) — deleted.\n` +
+                `(On Android 16, screen recording a "static one frame screen" via adb will produce a one frame mp4 file, which is not playable.)`
             );
         }
 
-        const mb = (fileSize / 1_000_000).toFixed(2);
+        // Re-encode with ffmpeg for playback compatibility and compression.
+        // Skip only if the caller explicitly passed ffmpegCrf: null.
+        if (ffmpegCrf !== null) {
+            reencodeVideo(localPath, ffmpegCrf, this.log);
+        } else {
+            this.log.warn("[ScreenRecorder] ffmpeg re-encode skipped (ffmpegCrf: null)");
+        }
+
+        const finalSize = fs.statSync(localPath).size;
+        const mb = (finalSize / 1_000_000).toFixed(2);
         this.log.info(`[ScreenRecorder] Done — ${localPath} (${mb} MB) in ${Date.now() - t0}ms`);
 
         return localPath;
